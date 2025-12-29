@@ -22,16 +22,16 @@ public:
     
     WbcResult solve(const Eigen::VectorXd& q,
                     const Eigen::VectorXd& v,
-                    const Eigen::VectorXd& q_target);
+                    const Eigen::VectorXd& q_target,
+                    const std::vector<bool>& contact_status);
 
 private:
     std::shared_ptr<PinocchioInterface> pinocchio_;
     qpOASES::SQProblem qp_solver_;
     
-    // QP sizing
     static constexpr int nv = 16;
-    static constexpr int nf = 12; // 4 contacts * 3 force components
-    static constexpr int n_vars = nv + nf; // 16 + 12 = 28
+    static constexpr int nf = 12; 
+    static constexpr int n_vars = nv + nf; 
     
     std::vector<std::string> contact_frame_names_ = {
         "leg_l_f1_link", "leg_l_f2_link", "leg_r_f1_link", "leg_r_f2_link"
@@ -43,8 +43,7 @@ private:
     };
     
     std::vector<int> joint_v_indices_;
-    
-    Eigen::VectorXd weight_qdd_, weight_f_;
+    Eigen::VectorXd weight_qdd_, weight_f_, weight_com_;
 };
 
 } // namespace legged_wbc
