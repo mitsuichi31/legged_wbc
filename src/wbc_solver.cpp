@@ -10,8 +10,8 @@
 namespace legged_wbc {
 
 WbcSolver::WbcSolver(std::shared_ptr<PinocchioInterface> pinocchio)
-    : pinocchio_(pinocchio), 
-      qp_solver_(n_vars, 26) {
+    : pinocchio_(pinocchio),
+      qp_solver_(n_vars, n_constraints) {
     
     for (const auto& name : joint_names_) {
         joint_v_indices_.push_back(pinocchio_->getJointIdxV(pinocchio_->getJointId(name)));
@@ -21,12 +21,51 @@ WbcSolver::WbcSolver(std::shared_ptr<PinocchioInterface> pinocchio)
     weight_qdd_.head(6).setConstant(0.01); // Very low penalty for base movement
     weight_qdd_.tail(10).setConstant(0.1); // Joint qdd penalty
     weight_f_ = Eigen::VectorXd::Constant(nf, 1e-4);
-    weight_com_ = Eigen::Vector3d(2000.0, 2000.0, 1000.0); // High weight for CoM X,Y, lower for Z
+    weight_contact_force_ = 0.0;
+    weight_contact_ = 0.0;
+    weight_com_ = Eigen::Vector3d(0.0, 0.0, 0.0);
+    weight_base_linear_ = 1.0;
+    weight_base_angular_ = 1.0;
+    base_xy_kp_ = 40.0;
+    base_xy_kd_ = 4.0;
+    base_height_kp_ = 20.0;
+    base_height_kd_ = 3.0;
+    base_angular_kp_ = 20.0;
+    base_angular_kd_ = 3.0;
+    com_target_x_ = 0.02;
+    torque_limits_ = Eigen::VectorXd::Zero(10);
+    torque_limits_ << 28.0, 60.0, 60.0, 60.0, 28.0,
+                      28.0, 60.0, 60.0, 60.0, 28.0;
     
     qpOASES::Options options;
     options.setToMPC();
     options.printLevel = qpOASES::PL_NONE;
     qp_solver_.setOptions(options);
+
+    contact_target_pos_.resize(contact_frame_names_.size(), Eigen::Vector3d::Zero());
+    contact_active_.resize(contact_frame_names_.size(), false);
+}
+
+void WbcSolver::setContactForceWeight(double weight) {
+    weight_contact_force_ = std::max(0.0, weight);
+}
+
+void WbcSolver::setContactTaskWeight(double weight) {
+    weight_contact_ = std::max(0.0, weight);
+}
+
+void WbcSolver::setBaseAngularGains(double kp, double kd) {
+    base_angular_kp_ = std::max(0.0, kp);
+    base_angular_kd_ = std::max(0.0, kd);
+}
+
+void WbcSolver::setComTargetX(double x) {
+    com_target_x_ = x;
+}
+
+void WbcSolver::setComWeight(double weight) {
+    double clamped = std::max(0.0, weight);
+    weight_com_ = Eigen::Vector3d(clamped, clamped, clamped);
 }
 
 WbcResult WbcSolver::solve(const Eigen::VectorXd& q,
@@ -65,16 +104,26 @@ WbcResult WbcSolver::solve(const Eigen::VectorXd& q,
     
     // Target CoM X slightly forward (+0.02) to compensate for battery/offset
     Eigen::Vector3d com_target = q_target.head(3);
-    com_target(0) = 0.02; // Geometric center offset
+    com_target(0) = com_target_x_; // Geometric center offset
     com_target(1) = 0.00;
     
-    Eigen::Vector3d com_acc_target = 250.0 * (com_target - com_pos) - 25.0 * com_vel;
+    Eigen::Vector3d com_acc_target = 50.0 * (com_target - com_pos) - 5.0 * com_vel;
     H_eig.block(0, 0, nv, nv) += J_com.transpose() * weight_com_.asDiagonal() * J_com;
     g_eig.segment(0, nv) += J_com.transpose() * weight_com_.asDiagonal() * (-com_acc_target);
 
-    // 2. Base Orientation Task
-    double weight_ori = 5000.0;
+    // 2. Base Linear Accel Task (world tracking, expressed in local frame)
     Eigen::Quaterniond q_curr(q(6), q(3), q(4), q(5));
+    Eigen::Vector3d v_base_local = v.head(3);
+    Eigen::Vector3d v_base_world = q_curr * v_base_local;
+    Eigen::Vector3d base_acc_world;
+    base_acc_world.x() = base_xy_kp_ * (q_target(0) - q(0)) - base_xy_kd_ * v_base_world.x();
+    base_acc_world.y() = base_xy_kp_ * (q_target(1) - q(1)) - base_xy_kd_ * v_base_world.y();
+    base_acc_world.z() = base_height_kp_ * (q_target(2) - q(2)) - base_height_kd_ * v_base_world.z();
+    Eigen::Vector3d base_acc_local = q_curr.inverse() * base_acc_world;
+    H_eig.block(0, 0, 3, 3).diagonal().array() += weight_base_linear_;
+    g_eig.segment(0, 3) += weight_base_linear_ * (-base_acc_local);
+
+    // 3. Base Orientation Task
     Eigen::Quaterniond q_tgt(q_target(6), q_target(3), q_target(4), q_target(5));
     Eigen::Quaterniond q_error = q_tgt * q_curr.inverse(); // Global error axis
     
@@ -84,13 +133,13 @@ WbcResult WbcSolver::solve(const Eigen::VectorXd& q,
     Eigen::Vector3d ori_err_local = q_curr.inverse() * ori_err_world;
     if (ori_err_local.norm() > 0.5) ori_err_local = 0.5 * ori_err_local.normalized();
     
-    Eigen::Vector3d ori_acc_target = 250.0 * ori_err_local - 30.0 * v.segment(3, 3);
+    Eigen::Vector3d ori_acc_target = base_angular_kp_ * ori_err_local - base_angular_kd_ * v.segment(3, 3);
     
-    H_eig.block(3, 3, 3, 3).diagonal().array() += weight_ori;
-    g_eig.segment(3, 3) += weight_ori * (-ori_acc_target);
+    H_eig.block(3, 3, 3, 3).diagonal().array() += weight_base_angular_;
+    g_eig.segment(3, 3) += weight_base_angular_ * (-ori_acc_target);
 
-    // 3. Contact Constraints as Soft Tasks (Kinematics)
-    double weight_contact = 5000.0;
+    // 4. Contact Constraints as Soft Tasks (Kinematics)
+    double weight_contact = weight_contact_;
     for (size_t i = 0; i < contact_frame_names_.size(); ++i) {
         if (!contact_status[i]) continue; 
         
@@ -100,19 +149,50 @@ WbcResult WbcSolver::solve(const Eigen::VectorXd& q,
         Eigen::MatrixXd J_trans = J.block(0, 0, 3, nv);
         
         Eigen::Vector3d foot_pos = data.oMf[frame_id].translation();
+        if (!contact_active_[i]) {
+            contact_target_pos_[i] = foot_pos;
+            contact_target_pos_[i].z() = 0.0;
+            contact_active_[i] = true;
+        }
         Eigen::Vector3d foot_vel = J_trans * v;
-        // Keep foot fixed on ground
-        Eigen::Vector3d foot_qdd_target = -400.0 * (foot_pos - Eigen::Vector3d(foot_pos.x(), foot_pos.y(), 0.0)) - 40.0 * foot_vel;
+        // Keep foot fixed at contact start pose
+        Eigen::Vector3d foot_qdd_target = -400.0 * (foot_pos - contact_target_pos_[i]) - 40.0 * foot_vel;
         
         H_eig.block(0, 0, nv, nv) += weight_contact * J_trans.transpose() * J_trans;
         g_eig.segment(0, nv) += weight_contact * J_trans.transpose() * (-foot_qdd_target);
     }
+    for (size_t i = 0; i < contact_frame_names_.size(); ++i) {
+        if (!contact_status[i]) {
+            contact_active_[i] = false;
+        }
+    }
     H_eig.block(nv, nv, nf, nf).diagonal() = weight_f_;
     H_eig.diagonal().array() += 1e-3; 
 
-    Eigen::MatrixXd A_eig = Eigen::MatrixXd::Zero(26, n_vars);
-    Eigen::VectorXd LB = Eigen::VectorXd::Zero(26);
-    Eigen::VectorXd UB = Eigen::VectorXd::Zero(26);
+    // 5. Contact Force Task (stance support)
+    Eigen::VectorXd f_target = Eigen::VectorXd::Zero(nf);
+    Eigen::VectorXd weight_f_contact = Eigen::VectorXd::Zero(nf);
+    int contact_count = 0;
+    for (bool c : contact_status) {
+        if (c) {
+            contact_count++;
+        }
+    }
+    if (contact_count > 0) {
+        double total_mass = data.mass[0];
+        double fz_per_contact = total_mass * 9.81 / static_cast<double>(contact_count);
+        for (size_t i = 0; i < contact_frame_names_.size(); ++i) {
+            if (!contact_status[i]) continue;
+            f_target.segment(3 * i, 3) = Eigen::Vector3d(0.0, 0.0, fz_per_contact);
+            weight_f_contact.segment(3 * i, 3).setConstant(weight_contact_force_);
+        }
+        H_eig.block(nv, nv, nf, nf).diagonal().array() += weight_f_contact.array();
+        g_eig.segment(nv, nf).array() += -weight_f_contact.array() * f_target.array();
+    }
+
+    Eigen::MatrixXd A_eig = Eigen::MatrixXd::Zero(n_constraints, n_vars);
+    Eigen::VectorXd LB = Eigen::VectorXd::Zero(n_constraints);
+    Eigen::VectorXd UB = Eigen::VectorXd::Zero(n_constraints);
     
     A_eig.block(0, 0, 6, nv) = data.M.block(0, 0, 6, nv);
     for (size_t i = 0; i < contact_frame_names_.size(); ++i) {
@@ -129,7 +209,7 @@ WbcResult WbcSolver::solve(const Eigen::VectorXd& q,
         int off_c = 6 + 5 * i;
         int off_f = nv + 3 * i;
         if (contact_status[i]) {
-            A_eig(off_c, off_f + 2) = 1.0; LB(off_c) = 1.0; UB(off_c) = 500.0;
+            A_eig(off_c, off_f + 2) = 1.0; LB(off_c) = 0.0; UB(off_c) = 500.0;
             A_eig(off_c+1, off_f) = 1.0; A_eig(off_c+1, off_f+2) = -mu; LB(off_c+1) = -1e10; UB(off_c+1) = 0.0;
             A_eig(off_c+2, off_f) = -1.0; A_eig(off_c+2, off_f+2) = -mu; LB(off_c+2) = -1e10; UB(off_c+2) = 0.0;
             A_eig(off_c+3, off_f+1) = 1.0; A_eig(off_c+3, off_f+2) = -mu; LB(off_c+3) = -1e10; UB(off_c+3) = 0.0;
@@ -142,9 +222,25 @@ WbcResult WbcSolver::solve(const Eigen::VectorXd& q,
             A_eig(off_c+4, off_f+1) = 1.0; LB(off_c+4) = 0.0; UB(off_c+4) = 0.0;
         }
     }
+
+    // Torque limits task: tau_min <= M*qdd + nle - J^T f <= tau_max
+    int off_tau = 26;
+    for (int i = 0; i < 10; ++i) {
+        int idx_v = joint_v_indices_[i];
+        A_eig.block(off_tau + i, 0, 1, nv) = data.M.row(idx_v);
+        for (size_t c = 0; c < contact_frame_names_.size(); ++c) {
+            auto frame_id = model.getFrameId(contact_frame_names_[c]);
+            Eigen::MatrixXd J = Eigen::MatrixXd::Zero(6, nv);
+            pinocchio::getFrameJacobian(model, data, frame_id, pinocchio::LOCAL_WORLD_ALIGNED, J);
+            Eigen::RowVectorXd jt_row = J.block(0, 0, 3, nv).transpose().row(idx_v);
+            A_eig.block(off_tau + i, nv + 3 * c, 1, 3) = -jt_row;
+        }
+        LB(off_tau + i) = -torque_limits_(i) - data.nle(idx_v);
+        UB(off_tau + i) = torque_limits_(i) - data.nle(idx_v);
+    }
     
     Eigen::Matrix<double, n_vars, n_vars, Eigen::RowMajor> H_rm = H_eig;
-    Eigen::Matrix<double, 26, n_vars, Eigen::RowMajor> A_rm = A_eig;
+    Eigen::Matrix<double, n_constraints, n_vars, Eigen::RowMajor> A_rm = A_eig;
     
     int nWSR = 1000;
     auto status = qp_solver_.init(H_rm.data(), g_eig.data(), A_rm.data(), nullptr, nullptr, LB.data(), UB.data(), nWSR);

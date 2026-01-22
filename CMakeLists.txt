@@ -9,6 +9,7 @@ find_package(rclcpp REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(controller_manager_msgs REQUIRED)
 find_package(pinocchio REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(qpOASES REQUIRED)
@@ -44,7 +45,7 @@ add_executable(wbc_node
   src/wbc_node.cpp
 )
 target_compile_options(wbc_node PRIVATE -w)
-ament_target_dependencies(wbc_node rclcpp std_msgs sensor_msgs pinocchio)
+ament_target_dependencies(wbc_node rclcpp std_msgs sensor_msgs geometry_msgs controller_manager_msgs pinocchio)
 target_link_libraries(wbc_node 
     wbc_solver 
     pinocchio_interface
